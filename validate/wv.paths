@@ -1,0 +1,86 @@
+# wv.paths -- settings for the Wabash 2-D SsPmp pipeline.
+# "key = value" per line, # starts a comment, an empty value means unset.
+# Every key here can be overridden by the matching --flag on the command line.
+# Used by: fdfk2d_setup.py, su2sac.py, sac_crossconv.py, wv_model2d.py, wv_invert.py
+
+# ============================ paths ============================
+events_root = /home/yaoj/data/SSPMP/wabash            # <event>/t8.dat, shift.dat, <sta>.r/.z
+tpmp        = /home/yaoj/paper/others/LiuYC/pmp/tpmp.xy
+grids_root  = /home/yaoj/C++/grid.jinv2024            # only to copy final synthetics
+fdfk2d_bin  = /home/yaoj/bin/FDFK2D
+
+# forward modelling (fdfk2d_setup.py)
+model_dir   = /home/yaoj/C++/FDFK2D/input_2d_wide     # must hold vp_model.su, vs_model.su
+out_root    = /home/yaoj/C++/FDFK2D/runs
+
+# STARTING MODEL for the inversion: the model build_2d_model.py made by
+# laterally interpolating the grid*/start.mod files. Parameters perturb ITS
+# Moho, so m = 0 reproduces it exactly. Leave this blank and you start from a
+# flat generic column instead, which you do not want.
+background_dir    = /home/yaoj/C++/FDFK2D/input_2d_wide
+background_x0_km  = -340.0      # left edge of THAT model; may differ from x0_km
+background_dx     = 200.0
+background_dz     = 200.0
+background_npml   = 20
+moho_vp           = 7500.0      # Vp contour used to pick its Moho
+dh_max_km         = 8.0         # bound on the Moho perturbation
+
+# inversion (wv_invert.py)
+work_root   = /home/yaoj/C++/FDFK2D/inv
+ref_1d      =                                          # optional: depth_km Vp Vs column
+
+# ============================ profile ============================
+# Recovered from tpmp.xy to 39 m rms. Replace with the real PRF line from the
+# parent para.mk if you find it (#include ../grid.jinv1996/para.mk).
+prf = -C-88.0047/38.4484 -A120.5
+
+# ============================ events ============================
+events = 20140824232145 20140825143137 20140925175117 20150323045138 20150529070009 20150624223221 20150729023559
+nproc  = 7
+
+# ============================ model grid ============================
+# Stations span +/-152 km but SsPmp bounce points reach -318..+222, so the FD
+# grid must be much wider than the region the grids resolve. Outside
+# structure_halfwidth_km the model is 1-D.
+# NB: x0_km must equal the left edge of whatever is in model_dir.
+x0_km = -340.0
+x1_km =  245.0
+dx    =  200.0
+dz    =  200.0
+Zkm   =   80.0
+npml  =   20
+norder =   8
+f0     =  0.8
+
+structure_halfwidth_km = 152.0
+node_spacing_km        =  40.0
+h0_km                  =  52.0     # only used when background_dir is blank
+
+# ============================ processing ============================
+freq        = 0.05 0.5
+freq_stages = 0.05 0.2  0.05 0.35  0.05 0.5   # low high pairs, run in order
+corners     = 2
+win         = -5.0 15.0
+taper       = 0.10
+dt_common   = 0.05
+pick_band   = 0.05 1.0
+
+# Verify once with: su2sac.py --paths wv.paths --run-dir ... --qc <grid dir>
+sign_r = -1.0
+sign_z = -1.0
+
+# ============================ inversion ============================
+lambda_smooth_gn = 0.5
+mu_damp          = 0.05
+h_min = 35.0
+h_max = 65.0
+gn_iters    = 5
+fd_delta_km = 1.0
+
+# Pull weakly-covered nodes toward zero perturbation (i.e. toward your
+# interpolated model) instead of letting them chase noise. In background mode
+# these are dh values, one per node; print the node positions with --dry-run.
+# prior_moho   = 0 0 0 0 0 0 0 0
+# lambda_prior = 1.0
+cc_win      = -5.0 15.0        # second cut on the cross-convolutions, tau=0 at S
+cc_taper    = 0.10

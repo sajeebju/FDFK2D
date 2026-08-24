@@ -1,0 +1,455 @@
+===============================================================================
+ WABASH 2-D SsPmp RUNBOOK
+ model building -> forward modelling -> cross-convolution -> 2-D inversion
+===============================================================================
+
+Everything runs from ONE directory.  Put these 7 files there; create no others.
+
+    cd /home/yaoj/C++/FDFK2D/validate
+    ls
+        wv.paths            <- edit the paths in this, once
+        fdfk2d_common.py
+        fdfk2d_setup.py
+        su2sac.py
+        sac_crossconv.py
+        wv_model2d.py
+        wv_invert.py
+
+Output directories (runs/, inv/, input_2d_wide/) are created automatically.
+
+Any value in wv.paths can be overridden by the matching --flag on the command
+line; the flag always wins.
+
+Notation below:  $V = /home/yaoj/C++/FDFK2D/validate
+                 EV = 20150323045138   (used for all single-event tests)
+
+
+===============================================================================
+ STEP 0   PREREQUISITE CHECK                                    ~1 minute
+===============================================================================
+
+cd /home/yaoj/C++/FDFK2D/validate
+
+python3 -c "import numpy, scipy, obspy, matplotlib; print('deps ok')"
+
+ls /home/yaoj/data/SSPMP/wabash/20150323045138/{t8.dat,shift.dat,WB12.z,WB12.r}
+ls /home/yaoj/paper/others/LiuYC/pmp/tpmp.xy
+ls -l /home/yaoj/bin/FDFK2D
+
+Edit wv.paths so events_root, tpmp, fdfk2d_bin, work_root, model_dir, out_root
+point at the right places.  grids_root is OPTIONAL - comment it out unless you
+want synthetics copied into the grid directories.
+
+TEST 0.1  the settings file parses and the profile is recovered
+-----------------------------------------------------------------------------
+python3 -c "
+import sys; sys.path.insert(0,'.')
+from fdfk2d_common import read_kv, ProfileGeom
+kv = read_kv('wv.paths')
+print('%d keys' % len(kv))
+print(ProfileGeom.from_prf(kv['prf']))
+"
+EXPECT:  ProfileGeom(-C-88.0047/38.4484 -A120.500  [x=0 at profile centre])
+
+TEST 0.2  the profile really does reproduce tpmp.xy
+-----------------------------------------------------------------------------
+python3 -c "
+import sys, numpy as np; sys.path.insert(0,'.')
+from fdfk2d_common import ProfileGeom, read_tpmp, read_kv
+g = ProfileGeom.from_tpmp(read_kv('wv.paths')['tpmp'])
+print(g)
+"
+EXPECT:  fit rms ~0.04 km.  If it is > 3 km the -C/-A in wv.paths is wrong;
+         get the real PRF line from the parent para.mk
+         (#include ../grid.jinv1996/para.mk) and paste it in.
+
+
+===============================================================================
+ STEP 1   BUILD THE 2-D VELOCITY MODEL                          ~1 minute
+===============================================================================
+
+The station array spans +/-152 km, but SsPmp bounce points reach -318..+222 km
+and the free-surface reflection point sits ~139 km up-dip of each station.  A
+342 km model is TOO NARROW - the edge stations form their SsPmp inside the
+FK/PML boundary.  Build -340..+245 km.
+
+OPTION A - your own builder (real structure from the grid inversion)
+-----------------------------------------------------------------------------
+python3 build_2d_model.py \
+    --grids_root /home/yaoj/C++/grid.jinv2024 \
+    --out        /home/yaoj/C++/FDFK2D/input_2d_wide \
+    --km_per_grid 1.0 --dx 200 --dz 200 --Zkm 80 --npml 20 \
+    --lat_smooth_km 5 --plot
+
+  You must make it span -340..+245 km.  Outside +/-152 there are no grids, so
+  hold the edge column constant (1-D wings) rather than extrapolating.
+
+  ***  USE OPTION A.  ***  That model, interpolated from the grid*/start.mod
+  files, is the starting model for the inversion: point background_dir at it in
+  wv.paths and the parameters become PERTURBATIONS to its Moho, so m = 0
+  reproduces your own result exactly and the inversion refines it.
+
+OPTION B - synthetic tests only
+-----------------------------------------------------------------------------
+python3 wv_model2d.py --paths wv.paths \
+    --out /tmp/testmodel --plot
+
+  Flat 52 km Moho on a generic WVSZ column, no lateral structure.  Only for
+  checking the machinery.  Add --ref-1d mycolumn.txt (depth_km Vp_m/s Vs_m/s)
+  for your own 1-D profile.
+
+TEST 1.3  background mode reproduces your interpolated model at m = 0
+-----------------------------------------------------------------------------
+python3 wv_model2d.py --paths wv.paths --out /tmp/bgcheck --plot
+EXPECT:  "background Moho 47.x .. 54.x km (from .../input_2d_wide)"
+         "model Moho      47.x .. 54.x km"    <- the two must MATCH at m=0
+eog /tmp/bgcheck/model.png     white dashed (background) under red (model)
+
+TEST 1.1  the model has the size you think
+-----------------------------------------------------------------------------
+python3 -c "
+import json; d = json.load(open('/home/yaoj/C++/FDFK2D/input_2d_wide/model_meta.json'))
+print('nx,nz', d['nx'], d['nz'], ' x', d['x0_km'], '..', d['x1_km'], 'km')
+"
+EXPECT:  nx 2926, nz 401, x -340 .. 245 km   (for dx=dz=200 m, Zkm=80)
+
+TEST 1.2  look at it
+-----------------------------------------------------------------------------
+eog /home/yaoj/C++/FDFK2D/input_2d_wide/model.png
+
+CHECK:  Moho continuous, no steps at the wing boundaries (dashed lines),
+        sediments present, mantle below.
+
+!! Whatever you choose, x0_km in wv.paths MUST equal the model's left edge.
+   -340 for input_2d_wide, -171 for your old input_2d.  Getting this wrong
+   silently pushes every station outside the model.
+
+
+===============================================================================
+ STEP 2   BUILD THE FDFK2D INPUT DECKS                          ~10 seconds
+===============================================================================
+
+Single event first, one receiver, to read the diagnostics:
+
+python3 fdfk2d_setup.py --paths wv.paths \
+    --events 20150323045138 --only-stations WB12
+
+READ THE OUTPUT.  It should say:
+
+  ProfileGeom(-C-88.0047/38.4484 -A120.500 ...)
+  model: vp_model.su (2966, 421) -> nx=2926, nz=401, X0..Xn = 0..585.0 km
+  shift.dat flag filter (=1) dropped 11 of 38 traces
+  event -18.3530N -69.1660E ...; check at WB12: gcarc 59.59 vs t8 59.59,
+                                                baz  158.54 vs t8 158.54
+  p = 0.11562 s/km = 12.857 s/deg
+  baz = 158.54, profile az = 120.50 -> theta = +38.04 deg, cos(theta) = +0.787,
+        wave enters from the right (+x)
+  [WARN] |baz - profile azimuth| = 38.0 deg exceeds FDFK2D's own 30 deg limit
+  az_org written to FD_model.dat = 120.7xxx deg
+  SsPmp surface reflection point sits ~139 km from the station toward the source
+  dt = 0.0074 s, tmax = 1xx s, tstp = 0.0148 s, nnnn samples/trace
+  wrote .../runs/20150323045138  (1 station receivers + 0 dense)
+
+STOP AND FIX if you see any of:
+  * "OUTSIDE the model -- dropped"      -> x0_km disagrees with model_dir
+  * "gcarc/baz disagrees by >2 deg"     -> SAC evla/evlo vs t8.dat mismatch
+  * "SsPmp reflection point within N km of the model edge" -> model too narrow
+  * "f0 above the dispersion-safe limit" -> lower --f0 or refine dx
+  * 0 station receivers                  -> shift.dat flags or paths wrong
+
+The 38 deg warning is EXPECTED for the three South American events
+(20140824232145, 20140825143137, 20150323045138).  The four northwestern
+events come in ~20-25 deg off the anti-profile direction and are fine.
+
+TEST 2.1  eyeball the deck
+-----------------------------------------------------------------------------
+cd /home/yaoj/C++/FDFK2D/runs/20150323045138/input
+cat FD_model.dat        # line 8 = lat / lon / azimuth  <- the parameter that
+                        #          is easiest to get silently wrong
+cat Source.dat          # ray parameter s/deg, src lat/lon
+cat FK_model_left.dat FK_model_right.dat   # last line must be IDENTICAL
+head -5 Receiver.dat
+
+TEST 2.2  the geometry is self-consistent
+-----------------------------------------------------------------------------
+cd /home/yaoj/C++/FDFK2D/validate
+python3 -c "
+import sys, json, numpy as np; sys.path.insert(0,'.')
+from fdfk2d_common import fdfk2d_theta
+m = json.load(open('/home/yaoj/C++/FDFK2D/runs/20150323045138/meta.json'))
+th = fdfk2d_theta(m['lat_org'], m['lon_org'], m['az_org'], m['evla'], m['evlo'],
+                  np.array([m['X0'], 0.5*(m['X0']+m['Xn']), m['Xn']]))
+print('theta at X0 / centre / Xn =', np.round(th,2), ' target', round(m['theta_true'],2))
+print('cos(theta) =', np.round(np.cos(np.radians(th)),3))
+"
+EXPECT: centre value equals theta_true, all three POSITIVE for an S event,
+        all three NEGATIVE for an N event.  A sign flip across the model
+        means the wave enters from the wrong side.
+
+
+===============================================================================
+ STEP 3   RUN ONE SIMULATION                                    ~15-30 minutes
+===============================================================================
+
+cd /home/yaoj/C++/FDFK2D/runs/20150323045138
+mkdir -p seismograms
+yes Y | /home/yaoj/bin/FDFK2D ./input inpar.dat ./seismograms seis 2>&1 | tee run.log
+
+The "yes Y" answers FDFK2D's interactive prompt when |baz-az| > 30 deg, which
+would otherwise hang.  Progress lines print every 50 steps with a remaining-time
+estimate that is trustworthy (it is (nt-it)*wall_per_50_steps/3000).
+
+TEST 3.1  it produced something
+-----------------------------------------------------------------------------
+ls -la seismograms/          # seisx.su and seisz.su, both non-zero
+grep -i "error\|nan\|unstable" run.log
+
+
+===============================================================================
+ STEP 4   SU -> SAC, AND VERIFY POLARITY                        ~10 seconds
+===============================================================================
+
+cd /home/yaoj/C++/FDFK2D/validate
+
+python3 su2sac.py --paths wv.paths \
+    --run-dir /home/yaoj/C++/FDFK2D/runs/20150323045138 \
+    --qc      /home/yaoj/C++/grid.jinv2024/grid-1 \
+    --plot
+
+TEST 4.1  polarity against your CPS synthetic   *** DO THIS ONCE, PROPERLY ***
+-----------------------------------------------------------------------------
+The --qc block prints, per station:
+
+    WB12   CPS peakZ=-1.23e-05   FDFK2D peakZ=-9.87e-06   SAME sign
+
+  SAME     -> keep sign_r = -1, sign_z = -1 in wv.paths
+  OPPOSITE -> flip the corresponding sign in wv.paths and rerun this step
+
+Do not skip this.  A sign error is absorbed into the cross-convolution scalar
+alpha, so it will NOT throw an error - it just quietly worsens every misfit.
+
+TEST 4.2  the picks are sane
+-----------------------------------------------------------------------------
+eog /home/yaoj/C++/FDFK2D/runs/20150323045138/sac/20150323045138_record_section.png
+
+CHECK:  red tick marks (picked S) follow a straight moveout line;
+        the wavefront tilts the correct way for the incidence side;
+        no trace is clipped at either end of the time axis.
+        "[WARN] N picks fall within 8 s of a trace end" -> raise tmax.
+
+
+===============================================================================
+ STEP 5   CROSS-CONVOLUTION, FDFK2D vs CPS                      ~10 seconds
+===============================================================================
+
+cp /home/yaoj/C++/FDFK2D/runs/20150323045138/sac/fdfk2d_20150323045138_WB12.[rz] \
+   /home/yaoj/C++/grid.jinv2024/grid-1/
+
+# the new 2-D synthetic
+python3 sac_crossconv.py --paths wv.paths \
+    --grid-dir /home/yaoj/C++/grid.jinv2024/grid-1 \
+    --syn-prefix fdfk2d_ --events 20150323045138 --stations WB12 \
+    --freq 0.05 0.5 --win -25 5 --plot
+
+# your existing CPS synthetic, identical settings = the control
+python3 sac_crossconv.py --paths wv.paths \
+    --grid-dir /home/yaoj/C++/grid.jinv2024/grid-1 \
+    --syn-prefix syn. --events 20150323045138 --stations WB12 \
+    --freq 0.05 0.5 --win -25 5 --plot
+
+TEST 5.1  interpret the two numbers
+-----------------------------------------------------------------------------
+  E    shape misfit, 0 = perfect, 2 = orthogonal  (computed on the
+       cross-convolutions AFTER the second cut+taper, --cc-win)
+  VR   variance reduction, 1 = perfect
+  lag  a SYSTEMATIC non-zero lag = wrong Moho depth (or inconsistent picks),
+       NOT a shape disagreement
+
+  FDFK2D ~ CPS          -> the 2-D machinery is wired correctly, proceed
+  FDFK2D >> CPS worse   -> the deck is wrong, not the model.  Go back to
+                           TEST 2.2 (geometry) and TEST 4.1 (polarity).
+  both bad              -> window, band, or the S picks.  Look at the PNG in
+                           grid-1/crossconv/ before changing anything else.
+
+eog /home/yaoj/C++/grid.jinv2024/grid-1/crossconv/*.png
+
+
+===============================================================================
+ STEP 6   ALL SEVEN EVENTS                                      ~2-3 hours
+===============================================================================
+
+cd /home/yaoj/C++/FDFK2D/validate
+
+python3 fdfk2d_setup.py --paths wv.paths          # all events, all stations
+bash /home/yaoj/C++/FDFK2D/runs/run_all.sh        # sequential; ~25 min each
+
+# parallel instead (7 cores):
+#   for ev in $(ls /home/yaoj/C++/FDFK2D/runs | grep 201); do
+#     ( cd /home/yaoj/C++/FDFK2D/runs/$ev && mkdir -p seismograms &&
+#       yes Y | /home/yaoj/bin/FDFK2D ./input inpar.dat ./seismograms seis \
+#       > run.log 2>&1 ) &
+#   done; wait
+
+for ev in 20140824232145 20140825143137 20140925175117 20150323045138 \
+          20150529070009 20150624223221 20150729023559; do
+  python3 su2sac.py --paths wv.paths \
+      --run-dir /home/yaoj/C++/FDFK2D/runs/$ev \
+      --grids-root /home/yaoj/C++/grid.jinv2024 --plot
+done
+
+python3 sac_crossconv.py --paths wv.paths \
+    --grids-root /home/yaoj/C++/grid.jinv2024 --syn-prefix fdfk2d_ \
+    --freq 0.05 0.5 --win -25 5 --csv fdfk2d_all.csv
+
+python3 sac_crossconv.py --paths wv.paths \
+    --grids-root /home/yaoj/C++/grid.jinv2024 --syn-prefix syn. \
+    --freq 0.05 0.5 --win -25 5 --csv cps_all.csv
+
+TEST 6.1  compare the two populations
+-----------------------------------------------------------------------------
+python3 -c "
+import csv, numpy as np
+for f in ('fdfk2d_all.csv','cps_all.csv'):
+    E=[float(r['E']) for r in csv.DictReader(open(f))]
+    L=[float(r['lag_s']) for r in csv.DictReader(open(f))]
+    print('%-16s n=%3d  mean E=%.4f  median lag=%+.2f s' %
+          (f, len(E), np.mean(E), np.median(L)))
+"
+
+
+===============================================================================
+ STEP 7   INVERSION - DRY RUN FIRST                             ~1 minute
+===============================================================================
+
+cd /home/yaoj/C++/FDFK2D/validate
+
+python3 wv_invert.py --paths wv.paths --method gn --dry-run
+
+READ:
+  * "N traces used (flag!=1 dropped M, not in tpmp.xy K)" per event.
+    ~26 for 20150323045138, ~175 over all seven.  This is your whole dataset.
+  * "traces per node: -152km:0, -112km:2, ..."
+    Nodes with <3 traces are UNCONSTRAINED.  Either widen them:
+        --node-spacing-km 60
+    or pin them to your Bayesian result by uncommenting in wv.paths:
+        prior_moho   = 52 52 53 54 53 52 52 51    (one per node, printed order)
+        lambda_prior = 1.0
+  * the cost estimate.  ~21 h on 7 cores for the default 3-stage gn schedule.
+
+
+===============================================================================
+ STEP 8   SANITY SWEEP BEFORE COMMITTING 20 HOURS               ~4 hours
+===============================================================================
+
+python3 wv_invert.py --paths wv.paths --method scan --scan -6 6 1.5
+
+Nine forward evaluations, uniform Moho shift.  Output:
+
+    shift  -6.00 km -> Phi 0.xxxxx
+    ...
+    best uniform shift +1.50 km, Phi 0.xxxxx
+
+PASS  a single clear minimum, near 0 if h0_km matches your Bayesian 52-54 km
+FAIL  monotonic, or the minimum sits at an end of the sweep
+      -> widen --scan, or something upstream is wrong.  Do NOT go to STEP 9.
+
+Cheaper variant if you want it in 40 minutes: add --events 20150323045138.
+
+
+===============================================================================
+ STEP 9   GAUSS-NEWTON INVERSION                                ~21 hours
+===============================================================================
+
+nohup python3 wv_invert.py --paths wv.paths --method gn --save-final \
+      > gn.out 2>&1 &
+
+tail -f /home/yaoj/C++/FDFK2D/inv/invert.log
+
+Three frequency stages run in order (0.05-0.2, 0.05-0.35, 0.05-0.5 Hz).  The low
+band has a ~+/-12 km capture range and hands its answer to the next - this is
+what protects you from cycle skipping.  Each iteration prints:
+
+    proposed dm [km]: [...]        the damped least-squares step
+    accepted step scale 1          or 0.5 / 0.25 if the linearisation strained
+    Moho [km]: [...]
+
+and at the end, per node:
+
+    x= -32.0 km   h =  53.41 +/- 0.84   resolution diag = 0.72
+
+Those error bars are CONDITIONAL on this parameterisation (8 nodes, fixed
+crustal velocity).  They are not a full uncertainty - that stays with your
+1-D hierarchical Bayesian result.  Say so in the paper.
+
+CHECKPOINTS - safe to inspect or kill at any time:
+    inv/gn_history.json      m and Phi after every accepted iteration
+    inv/gn_posterior.npz     m, Cm, R, sd, x_nodes
+    inv/*/misfit.json        per-evaluation per-trace misfit
+
+TEST 9.1  regularisation is not doing the work for you
+-----------------------------------------------------------------------------
+Rerun the last stage at three damping values and compare:
+
+  for lam in 0.1 0.5 2.0; do
+    python3 wv_invert.py --paths wv.paths --method gn --gn-iters 3 \
+        --lambda-smooth-gn $lam --freq-stages 0.05 0.5 \
+        --work-root /home/yaoj/C++/FDFK2D/inv_lam$lam \
+        --m-from /home/yaoj/C++/FDFK2D/inv/gn_history.json
+  done
+
+Plot final Phi against Moho roughness.  Take the corner of the L-curve.  If the
+answer barely moves between 0.1 and 2.0, the data are driving it - report that.
+
+
+===============================================================================
+ STEP 10   LOOK AT THE FIT                                      ~25 minutes
+===============================================================================
+
+Already done if you passed --save-final in STEP 9.  Otherwise:
+
+python3 wv_invert.py --paths wv.paths --method forward --save-final \
+    --m-from /home/yaoj/C++/FDFK2D/inv/gn_history.json
+
+Outputs under inv/final/ :
+
+    synthetics/<event>/   *** the seven event folders ***
+                          fdfk2d_<ev>_<sta>.r / .z  full SAC, polarity applied,
+                          SAC header a = picked direct S, plus syn.tw and a
+                          record section per event
+
+    fit_summary.png       *** open this first ***
+                          misfit vs bounce point, under the Moho that made it
+    record_section.png    every trace, observed black over synthetic red
+    fit/<ev>_<sta>.png    per trace: obs vs syn R, obs vs syn Z, the two
+                          cross-convolutions
+    fit.csv               per-trace E, weight, alpha, pick
+    model/                vp_model.su, vs_model.su, model.png
+
+HOW TO READ fit_summary.png
+    E spikes where the Moho has a kink   -> that node is fitting noise, raise
+                                            lambda_smooth_gn or lambda_prior
+    E uniformly high everywhere          -> upstream problem, not the model
+    E high only for the S events         -> the 38 deg off-plane geometry;
+                                            expected, mention it in the paper
+    E low and flat                       -> done
+
+The log also names the five worst-fitting traces; open their fit/ panels first.
+
+
+===============================================================================
+ QUICK REFERENCE - WHAT BREAKS AND WHY
+===============================================================================
+
+symptom                              cause
+-----------------------------------  ------------------------------------------
+0 station receivers                  x0_km != model left edge, or paths wrong
+"OUTSIDE the model -- dropped"       same
+all E ~ 1.0, alpha negative          polarity: rerun TEST 4.1
+systematic non-zero lag              Moho depth offset, not a shape problem
+picks near trace end                 tmax too small, rebuild decks
+FDFK2D hangs with no output          the [Y/N] prompt: use "yes Y |"
+garbage SU / ns wrong                tstp > 0.032768 s or ns > 32767
+                                     (INTEGER*2 headers, wraps silently)
+gn converges then Phi jumps at the   cycle skipping: start from a lower band
+next frequency stage
+E worse than CPS everywhere          the deck, not the model: TEST 2.2 then 4.1
